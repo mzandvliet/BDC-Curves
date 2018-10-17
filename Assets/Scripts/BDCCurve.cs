@@ -33,6 +33,7 @@ public class BDCCurve : MonoBehaviour {
 	[SerializeField] private Material _mat;
 
 	private NativeArray<float3> _curve;
+	private NativeArray<float> _distanceCache;
 	private Rng _rng;
 
     private NativeArray<float3> _verts;
@@ -49,14 +50,16 @@ public class BDCCurve : MonoBehaviour {
 	private MeshRenderer _renderer;
 	private MeshFilter _meshFilter;
 
-    const int RES = 32 + 1;
+    const int RES = 64 + 1;
     const int NUMVERTS = RES * RES;
+	const int NUMTRIS = (RES - 1) * (RES - 1) * 6;
 
 	JobHandle _handle;
 
 
 	private void Awake () {
 		_curve = new NativeArray<float3>(3, Allocator.Persistent);
+        _distanceCache = new NativeArray<float>(64, Allocator.Persistent);
 
 		_curve[0] = new float3(0f, 0f, 0f);
         _curve[1] = new float3(2f, 0f, 0f);
@@ -72,17 +75,18 @@ public class BDCCurve : MonoBehaviour {
 
         _verts = new NativeArray<float3>(NUMVERTS, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
         _normals = new NativeArray<float3>(NUMVERTS, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-        _triangles = new NativeArray<int>((RES-1)*(RES-1)*6, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+        _triangles = new NativeArray<int>(NUMTRIS, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
         _uvs = new NativeArray<float2>(NUMVERTS, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
         _vertsMan = new Vector3[NUMVERTS];
 		_normalsMan = new Vector3[NUMVERTS];
-        _trianglesMan = new int[(RES - 1) * (RES - 1) * 6];
+        _trianglesMan = new int[NUMTRIS];
         _uvsMan = new Vector2[NUMVERTS];
     }
 
 	private void OnDestroy() {
 		_curve.Dispose();
+		_distanceCache.Dispose();
 
 		_verts.Dispose();
 		_normals.Dispose();
@@ -95,18 +99,21 @@ public class BDCCurve : MonoBehaviour {
 
 		Relax();
 
+		BDC3.CacheDistances(_curve[0], _curve[1], _curve[2], _distanceCache);
+
         var j = new MakeMeshJob();
         j.verts = _verts;
         j.normals = _normals;
         j.triangles = _triangles;
         j.uvs = _uvs;
-        j._curve = _curve;
+        j.curve = _curve;
+		j.distances = _distanceCache;
         _handle = j.Schedule();
 		JobHandle.ScheduleBatchedJobs();
 	}
 
 	private void Relax() {
-		// Todo: I want the partial derivatives of the following with respect to _points[1]
+		// Todo: I want the partial derivatives of the following with respect to _po5s[1]
 		// But I can cheat for now
 
 		// First step: apply control point constraints
@@ -191,20 +198,21 @@ public class BDCCurve : MonoBehaviour {
         public NativeArray<float2> uvs;
         public NativeArray<float3> normals;
 
-        public NativeArray<float3> _curve;
+        public NativeArray<float3> curve;
+		public NativeArray<float> distances;
 
         public void Execute() {
             for (int i = 0; i < verts.Length; i++) {
                 var pos = Math.ToXZFloat(i, RES);
 				var posNorm = new float2(pos.x / (float)(RES-1), pos.z / (float)(RES-1));
 
-				var p = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], posNorm.x);
+				var p = BDC3.Evaluate(curve[0], curve[1], curve[2], posNorm.x);
 				p.z = pos.z / (float)(RES - 1) * 4f;
 
 				// Todo: this calculation can be cumulative along mesh, this is pretty wasteful
-				float uvx = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], posNorm.x, 64) / 4f;
+				float uvx = BDC3.LengthEuclidApprox(distances, posNorm.x) / 4f;
 
-				normals[i] = BDC3.EvaluateNormalApprox(_curve[0], _curve[1], _curve[2], posNorm.x);
+				normals[i] = BDC3.EvaluateNormalApprox(curve[0], curve[1], curve[2], posNorm.x);
                 verts[i] = p;
 				uvs[i] = new float2(uvx, posNorm.y);
             }
@@ -373,7 +381,7 @@ public static class BDC3 {
         return dist;
     }
 
-    public static float LengthEuclidApprox(float3 a, float3 b, float3 c, float t, int steps) {
+    public static float LengthEuclidApproxUnCached(float3 a, float3 b, float3 c, float t, int steps) {
         float dist = 0;
 
         float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
@@ -386,4 +394,27 @@ public static class BDC3 {
 
         return dist;
     }
+
+    public static float LengthEuclidApprox(NativeArray<float> distances, float t) {
+        t = t * (distances.Length-1);
+		int ti = (int)t;
+		if (ti < 1) {
+			return 0f;
+		}
+		return math.lerp(distances[ti-1], distances[ti], t - (float)ti);
+    }
+
+	// Instead of storing at linear t spacing, why not store with non-linear t-spacing and lerp between them?
+	public static void CacheDistances(float3 a, float3 b, float3 c, NativeArray<float> outDistances) {
+        float dist = 0;
+		outDistances[0] = 0f;
+        float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
+		for (int i = 1; i < outDistances.Length; i++) {
+            float t = (i / (float)outDistances.Length);
+            float3 p = BDC3.Evaluate(a, b, c, t);
+            dist += Length(p - pPrev);
+			outDistances[i] = dist;
+            pPrev = p;
+		}
+	}
 }

@@ -1,4 +1,10 @@
-﻿Shader "Custom/DoubleSided" {
+﻿/* 
+ * Uses VFACE trick described here: 
+ * https://forum.unity.com/threads/double-sided-material.474594/
+ * https://forum.unity3d.com/threads/standard-shader-modified-to-be-double-sided-is-very-shiny-on-the-underside.393068/#post-2574717
+ */
+
+Shader "Custom/DoubleSided" {
 	Properties {
 		_Color ("Color", Color) = (1,1,1,1)
 		_TopTex ("Top Albedo (RGB)", 2D) = "white" {}
@@ -80,6 +86,7 @@
 			fixed4 c = 0;
 			if (IN.facing < 0.5) {
                 c = tex2D (_BottomTex, IN.uv_TopTex) * _Color;
+				o.Normal *= -1.0;
 			} else {
 				c = tex2D (_TopTex, IN.uv_TopTex) * _Color;
 			}
@@ -88,10 +95,6 @@
 			o.Metallic = _Metallic;
 			o.Smoothness = _Glossiness;
 			o.Alpha = c.a;
-
-			if (IN.facing < 0.5) {
-                o.Normal *= -1.0;
-			}
 		}
 		ENDCG
 	}
