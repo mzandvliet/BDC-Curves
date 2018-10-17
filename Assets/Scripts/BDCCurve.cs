@@ -7,9 +7,22 @@ using Rng = Unity.Mathematics.Random;
 using Unity.Collections.LowLevel.Unsafe;
 
 /* Todo:
-	Two approaches for mesh deformation: regenerate mesh each frame, or do displacement in vertex shader
+	A few approaches for mesh deformation: 
+	
+	Regenerate mesh each frame, or do displacement in vertex shader
 	Vertex shader approach would only require a single spline to define the whole thing.
-	Could also store mesh in compute buffer and DrawProcedural
+	Could also store mesh in compute buffer and use DrawProcedural
+	Using Burst for this test
+	
+
+	Need to calculate derivatives for normals
+	Need to move paper by control point (which itself is constrained)
+	Need to apply constant-area constraint and make middle control point solve that constraint
+	
+	When I have that, I send the mail.
+
+	So set it up that we move the paper edge, and it is constraint to a euclidean max distance from the start
+	of the fold. Then use a numerical algorithm to move the middle control point to satisfy length == 1
 
 	Reformulate without Euclidean distance metric.
  */
@@ -34,16 +47,18 @@ public class BDCCurve : MonoBehaviour {
 	private MeshRenderer _renderer;
 	private MeshFilter _meshFilter;
 
-    const int RES = 8;
+    const int RES = 64 + 1;
     const int NUMVERTS = RES * RES;
+
+	JobHandle _handle;
 
 
 	private void Awake () {
 		_points = new NativeArray<float3>(3, Allocator.Persistent);
 
-		_points[0] = new float3(0f, 0f, 0f);
-        _points[1] = new float3(-1f, 0f, 0f);
-        _points[2] = new float3(-1f, 1f, 0f);
+		_points[0] = new float3(0f, 2f, 0f);
+        _points[1] = new float3(0f, 0f, 0f);
+        _points[2] = new float3(4f, 0f, 0f);
 
 		_rng = new Rng(1234);
 
@@ -62,16 +77,6 @@ public class BDCCurve : MonoBehaviour {
 		_normalsMan = new Vector3[NUMVERTS];
         _trianglesMan = new int[(RES - 1) * (RES - 1) * 6];
         _uvsMan = new Vector2[NUMVERTS];
-
-		var j = new MakeMeshJob();
-		j.verts = _verts;
-		j.normals = _normals;
-		j.triangles = _triangles;
-		j.uvs = _uvs;
-		j.points = _points;
-		j.Schedule().Complete();
-
-		UpdateMesh();
     }
 
 	private void OnDestroy() {
@@ -85,6 +90,19 @@ public class BDCCurve : MonoBehaviour {
 	
 	private void Update () {
 		_points[1] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime;
+
+        var j = new MakeMeshJob();
+        j.verts = _verts;
+        j.normals = _normals;
+        j.triangles = _triangles;
+        j.uvs = _uvs;
+        j.points = _points;
+        _handle = j.Schedule();
+		JobHandle.ScheduleBatchedJobs();
+	}
+
+	private void LateUpdate() {
+        UpdateMesh();
 	}
 
 	private void OnDrawGizmos() {
@@ -102,7 +120,7 @@ public class BDCCurve : MonoBehaviour {
         Gizmos.DrawSphere(pPrev, 0.01f);
 		int steps = 16;
 		for (int i = 1; i <= steps; i++) {
-			float t = 2f * (i / (float)steps);
+			float t = (i / (float)steps);
 			float3 p = BDC3.Evaluate(_points[0], _points[1], _points[2], t);
 			Gizmos.DrawLine(pPrev, p);
             Gizmos.DrawSphere(p, 0.01f);
@@ -111,10 +129,12 @@ public class BDCCurve : MonoBehaviour {
 	}
 
 	private void OnGUI() {
-		GUILayout.Label("Length: " + BDC3.LengthEuclidean(_points[0], _points[1], _points[2], 16));
+		GUILayout.Label("Length: " + BDC3.LengthEuclidApprox(_points[0], _points[1], _points[2], 16));
 	}
 
 	private void UpdateMesh() {
+		_handle.Complete();
+
 		Util.Copy(_vertsMan, _verts);
         Util.Copy(_normalsMan, _normals);
         Util.Copy(_trianglesMan, _triangles);
@@ -139,10 +159,14 @@ public class BDCCurve : MonoBehaviour {
         public void Execute() {
             for (int i = 0; i < verts.Length; i++) {
                 var pos = Math.ToXZFloat(i, RES);
-				verts[i] = pos;
+				var posNorm = new float2(pos.x / (float)(RES-1), pos.z / (float)(RES-1));
 
-				normals[i] = new float3(0f, 1f, 0f);
-				uvs[i] = new float2(pos.x / (float)RES, pos.z / (float)RES);
+				var p = BDC3.Evaluate(points[0], points[1], points[2], posNorm.x);
+				p.z = pos.z / (float)(RES - 1) * 4f;
+
+				normals[i] = BDC3.EvaluateNormalApprox(points[0], points[1], points[2], posNorm.x);
+                verts[i] = p;
+				uvs[i] = posNorm;
             }
 
 			int idx = 0;
@@ -277,7 +301,7 @@ public static class BDC3 {
     public static float3 Lerp(float3 a, float3 b, float t) {
         return t * a + (1f - t) * b;
     }
-    public static float3 EvaluateWithLerp(float3 a, float3 b, float3 c, float t) {
+    public static float3 EvaluateCasteljau(float3 a, float3 b, float3 c, float t) {
         return Lerp(Lerp(a, b, t), Lerp(b, c, t), t);
     }
 
@@ -286,7 +310,16 @@ public static class BDC3 {
         return u * u * a + 2f * t * u * b + t * t * c;
     }
 
-    public static float LengthEuclidean(float3 a, float3 b, float3 c, int steps) {
+    public static float3 EvaluateNormalApprox(float3 a, float3 b, float3 c, float t) {
+		const float EPS = 0.001f;
+
+        float3 p0 = Evaluate(a,b,c,t-EPS);
+        float3 p1 = Evaluate(a,b,c,t+EPS);
+
+		return math.cross(new float3(0,0,1), math.normalize(p1 - p0));
+    }
+
+    public static float LengthEuclidApprox(float3 a, float3 b, float3 c, int steps) {
         float dist = 0;
 
         float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
