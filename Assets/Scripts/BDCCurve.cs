@@ -13,6 +13,8 @@ using Unity.Collections.LowLevel.Unsafe;
 	Vertex shader approach would only require a single spline to define the whole thing.
 	Could also store mesh in compute buffer and use DrawProcedural
 	Using Burst for this test
+
+	Could also make it a softbody sim with constraints. Would fix uv-swimming.
 	
 
 	Need to calculate derivatives for normals
@@ -47,7 +49,7 @@ public class BDCCurve : MonoBehaviour {
 	private MeshRenderer _renderer;
 	private MeshFilter _meshFilter;
 
-    const int RES = 64 + 1;
+    const int RES = 32 + 1;
     const int NUMVERTS = RES * RES;
 
 	JobHandle _handle;
@@ -56,8 +58,8 @@ public class BDCCurve : MonoBehaviour {
 	private void Awake () {
 		_curve = new NativeArray<float3>(3, Allocator.Persistent);
 
-		_curve[0] = new float3(0f, 2f, 0f);
-        _curve[1] = new float3(0f, 0f, 0f);
+		_curve[0] = new float3(0f, 0f, 0f);
+        _curve[1] = new float3(2f, 0f, 0f);
         _curve[2] = new float3(4f, 0f, 0f);
 
 		_rng = new Rng(1234);
@@ -109,7 +111,7 @@ public class BDCCurve : MonoBehaviour {
 
 		// First step: apply control point constraints
 
-		_curve[0] = ClampToFloor(_curve[0]);
+		_curve[0] = ClipHeight(_curve[0], 0.05f);
 
 		var handleDelta = _curve[0] - _curve[2];
 		if (BDC3.Length(handleDelta) > 4f) {
@@ -120,20 +122,20 @@ public class BDCCurve : MonoBehaviour {
 
 		int iters = 0;
 		float deltaLength = 1f;
-		while (deltaLength > 0.001f && iters < 16) {
-            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 32);
+		while (deltaLength > 0.001f && iters < 64) {
+            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 64);
             float3 midPoint = (_curve[0] + _curve[2]) * 0.5f;
             float3 deltaFromMid = _curve[1] - midPoint;
             deltaLength = 4f - length;
             _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 20f;
 			_curve[1] += new float3(0f, -0.3f * Time.deltaTime, 0f); // a gravity term
 
-			_curve[1] = ClampToFloor(_curve[1]);
+			_curve[1] = ClipHeight(_curve[1], 0f);
 		}
 	}
 
-	private static float3 ClampToFloor(float3 p) {
-		return new float3(p.x, math.max(0f, p.y), p.z);
+	private static float3 ClipHeight(float3 p, float min) {
+		return new float3(p.x, math.max(min, p.y), p.z);
 	}
 
 	private void LateUpdate() {
@@ -199,6 +201,7 @@ public class BDCCurve : MonoBehaviour {
 				var p = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], posNorm.x);
 				p.z = pos.z / (float)(RES - 1) * 4f;
 
+				// Todo: this calculation can be cumulative along mesh, this is pretty wasteful
 				float uvx = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], posNorm.x, 64) / 4f;
 
 				normals[i] = BDC3.EvaluateNormalApprox(_curve[0], _curve[1], _curve[2], posNorm.x);
