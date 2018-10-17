@@ -109,8 +109,8 @@ public class BDCCurve : MonoBehaviour {
 
 		// First step: apply control point constraints
 
-		_curve[0] = ClampY(_curve[0]);
-		
+		_curve[0] = ClampToFloor(_curve[0]);
+
 		var handleDelta = _curve[0] - _curve[2];
 		if (BDC3.Length(handleDelta) > 4f) {
 			_curve[0] = _curve[2] + math.normalize(handleDelta) * 4f;
@@ -120,19 +120,19 @@ public class BDCCurve : MonoBehaviour {
 
 		int iters = 0;
 		float deltaLength = 1f;
-		while (deltaLength > 0.01f && iters < 8) {
-            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 16);
+		while (deltaLength > 0.001f && iters < 16) {
+            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 32);
             float3 midPoint = (_curve[0] + _curve[2]) * 0.5f;
             float3 deltaFromMid = _curve[1] - midPoint;
             deltaLength = 4f - length;
-            _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 10f;
-			_curve[1] += new float3(0f, -1f * Time.deltaTime, 0f);
+            _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 20f;
+			_curve[1] += new float3(0f, -0.3f * Time.deltaTime, 0f); // a gravity term
 
-			_curve[1] = ClampY(_curve[1]);
+			_curve[1] = ClampToFloor(_curve[1]);
 		}
 	}
 
-	private static float3 ClampY(float3 p) {
+	private static float3 ClampToFloor(float3 p) {
 		return new float3(p.x, math.max(0f, p.y), p.z);
 	}
 
@@ -199,9 +199,11 @@ public class BDCCurve : MonoBehaviour {
 				var p = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], posNorm.x);
 				p.z = pos.z / (float)(RES - 1) * 4f;
 
+				float uvx = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], posNorm.x, 64) / 4f;
+
 				normals[i] = BDC3.EvaluateNormalApprox(_curve[0], _curve[1], _curve[2], posNorm.x);
                 verts[i] = p;
-				uvs[i] = posNorm;
+				uvs[i] = new float2(uvx, posNorm.y);
             }
 
 			int idx = 0;
@@ -361,6 +363,20 @@ public static class BDC3 {
         for (int i = 1; i <= steps; i++) {
             float t = i / (float)steps;
             float3 p = BDC3.Evaluate(a, b, c, t);
+            dist += Length(p - pPrev);
+            pPrev = p;
+        }
+
+        return dist;
+    }
+
+    public static float LengthEuclidApprox(float3 a, float3 b, float3 c, float t, int steps) {
+        float dist = 0;
+
+        float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
+        for (int i = 1; i <= steps; i++) {
+            float tNow = t * (i / (float)steps);
+            float3 p = BDC3.Evaluate(a, b, c, tNow);
             dist += Length(p - pPrev);
             pPrev = p;
         }
