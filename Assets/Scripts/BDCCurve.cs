@@ -91,7 +91,7 @@ public class BDCCurve : MonoBehaviour {
 	}
 	
 	private void Update () {
-		_curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 4f;
+		_curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 10f;
 
 		Relax();
 
@@ -114,7 +114,7 @@ public class BDCCurve : MonoBehaviour {
 
 		// First step: apply control point constraints
 
-		_curve[0] = ClipHeight(_curve[0], 0.05f);
+		_curve[0] = ClipHeight(_curve[0], 0.05f, 2f);
 
 		var handleDelta = _curve[0] - _curve[2];
 		if (BDC3.Length(handleDelta) > 4f) {
@@ -125,25 +125,28 @@ public class BDCCurve : MonoBehaviour {
 		// Todo: momentum
 
 		int iters = 0;
-		float deltaLength = 1f;
-		while (deltaLength > 0.001f && iters < 64) {
+		float lengthError = 1f;
+		while (lengthError > 0.001f && iters < 64) {
 			int refinementSteps = 4 + iters / 16;
             float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], refinementSteps);
-            float3 midPoint = (_curve[0] + _curve[2]) * 0.5f;
-            float3 deltaFromMid = _curve[1] - midPoint;
-            deltaLength = 4f - length;
-            _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 20f;
-			_curve[1] += new float3(0f, -0.5f * Time.deltaTime, 0f); // a gravity term
+			float3 midPoint = (_curve[2] + _curve[0]) * 0.5f;
+            float3 cord = math.normalize(_curve[2] - _curve[0]);
+			float3 perp = math.cross(cord, new float3(0f, 0f, 1f));
+            lengthError = length - 4f;
 
-			_curve[1] = ClipHeight(_curve[1], 0f);
-            _curve[1] = StayLeftOf(_curve[1], _curve[2].x);
+            _curve[1] += perp * (lengthError < 0f ? (lengthError * lengthError) * 1f : 0);
+            _curve[1] += math.normalize((_curve[1] - midPoint)) * -lengthError * 1f;
+			_curve[1] += new float3(0f, -0.02f * math.abs(lengthError), 0f); // a gravity term
+
+			_curve[1] = ClipHeight(_curve[1], 0f, 4f);
+            // _curve[1] = StayLeftOf(_curve[1], _curve[2].x - 0.5f);
 
 			iters++;
 		}
 	}
 
-	private static float3 ClipHeight(float3 p, float min) {
-		return new float3(p.x, math.max(min, p.y), p.z);
+	private static float3 ClipHeight(float3 p, float min, float max) {
+		return new float3(p.x, math.clamp(p.y, min, max), p.z);
 	}
 
     private static float3 StayLeftOf(float3 p, float goal) {
