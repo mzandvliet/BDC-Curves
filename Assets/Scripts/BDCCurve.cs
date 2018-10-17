@@ -30,7 +30,7 @@ using Unity.Collections.LowLevel.Unsafe;
 public class BDCCurve : MonoBehaviour {
 	[SerializeField] private Material _mat;
 
-	private NativeArray<float3> _points;
+	private NativeArray<float3> _curve;
 	private Rng _rng;
 
     private NativeArray<float3> _verts;
@@ -54,11 +54,11 @@ public class BDCCurve : MonoBehaviour {
 
 
 	private void Awake () {
-		_points = new NativeArray<float3>(3, Allocator.Persistent);
+		_curve = new NativeArray<float3>(3, Allocator.Persistent);
 
-		_points[0] = new float3(0f, 2f, 0f);
-        _points[1] = new float3(0f, 0f, 0f);
-        _points[2] = new float3(4f, 0f, 0f);
+		_curve[0] = new float3(0f, 2f, 0f);
+        _curve[1] = new float3(0f, 0f, 0f);
+        _curve[2] = new float3(4f, 0f, 0f);
 
 		_rng = new Rng(1234);
 
@@ -80,7 +80,7 @@ public class BDCCurve : MonoBehaviour {
     }
 
 	private void OnDestroy() {
-		_points.Dispose();
+		_curve.Dispose();
 
 		_verts.Dispose();
 		_normals.Dispose();
@@ -89,16 +89,51 @@ public class BDCCurve : MonoBehaviour {
 	}
 	
 	private void Update () {
-		_points[1] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime;
+		_curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 4f;
+
+		Relax();
 
         var j = new MakeMeshJob();
         j.verts = _verts;
         j.normals = _normals;
         j.triangles = _triangles;
         j.uvs = _uvs;
-        j.points = _points;
+        j._curve = _curve;
         _handle = j.Schedule();
 		JobHandle.ScheduleBatchedJobs();
+	}
+
+	private void Relax() {
+		// Todo: I want the partial derivatives of the following with respect to _points[1]
+		// But I can cheat for now
+
+		// First step: apply control point constraints
+
+		_curve[0] = ClampY(_curve[0]);
+		
+		var handleDelta = _curve[0] - _curve[2];
+		if (BDC3.Length(handleDelta) > 4f) {
+			_curve[0] = _curve[2] + math.normalize(handleDelta) * 4f;
+		}
+
+		// Step 2, relax the curvature control to be above ground, and keep paper area constant
+
+		int iters = 0;
+		float deltaLength = 1f;
+		while (deltaLength > 0.01f && iters < 8) {
+            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 16);
+            float3 midPoint = (_curve[0] + _curve[2]) * 0.5f;
+            float3 deltaFromMid = _curve[1] - midPoint;
+            deltaLength = 4f - length;
+            _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 10f;
+			_curve[1] += new float3(0f, -1f * Time.deltaTime, 0f);
+
+			_curve[1] = ClampY(_curve[1]);
+		}
+	}
+
+	private static float3 ClampY(float3 p) {
+		return new float3(p.x, math.max(0f, p.y), p.z);
 	}
 
 	private void LateUpdate() {
@@ -111,17 +146,17 @@ public class BDCCurve : MonoBehaviour {
 		}
 
 		Gizmos.color = Color.blue;
-        for (int i = 0; i < _points.Length; i++) {
-            Gizmos.DrawSphere(_points[i], 0.05f);
+        for (int i = 0; i < _curve.Length; i++) {
+            Gizmos.DrawSphere(_curve[i], 0.05f);
         }
 
 		Gizmos.color = Color.white;
-		float3 pPrev = BDC3.Evaluate(_points[0], _points[1], _points[2], 0f);
+		float3 pPrev = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], 0f);
         Gizmos.DrawSphere(pPrev, 0.01f);
 		int steps = 16;
 		for (int i = 1; i <= steps; i++) {
 			float t = (i / (float)steps);
-			float3 p = BDC3.Evaluate(_points[0], _points[1], _points[2], t);
+			float3 p = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], t);
 			Gizmos.DrawLine(pPrev, p);
             Gizmos.DrawSphere(p, 0.01f);
 			pPrev = p;
@@ -129,7 +164,7 @@ public class BDCCurve : MonoBehaviour {
 	}
 
 	private void OnGUI() {
-		GUILayout.Label("Length: " + BDC3.LengthEuclidApprox(_points[0], _points[1], _points[2], 16));
+		GUILayout.Label("Length: " + BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 16));
 	}
 
 	private void UpdateMesh() {
@@ -154,17 +189,17 @@ public class BDCCurve : MonoBehaviour {
         public NativeArray<float2> uvs;
         public NativeArray<float3> normals;
 
-        public NativeArray<float3> points;
+        public NativeArray<float3> _curve;
 
         public void Execute() {
             for (int i = 0; i < verts.Length; i++) {
                 var pos = Math.ToXZFloat(i, RES);
 				var posNorm = new float2(pos.x / (float)(RES-1), pos.z / (float)(RES-1));
 
-				var p = BDC3.Evaluate(points[0], points[1], points[2], posNorm.x);
+				var p = BDC3.Evaluate(_curve[0], _curve[1], _curve[2], posNorm.x);
 				p.z = pos.z / (float)(RES - 1) * 4f;
 
-				normals[i] = BDC3.EvaluateNormalApprox(points[0], points[1], points[2], posNorm.x);
+				normals[i] = BDC3.EvaluateNormalApprox(_curve[0], _curve[1], _curve[2], posNorm.x);
                 verts[i] = p;
 				uvs[i] = posNorm;
             }
