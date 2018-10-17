@@ -7,26 +7,22 @@ using Rng = Unity.Mathematics.Random;
 using Unity.Collections.LowLevel.Unsafe;
 
 /* Todo:
-	A few approaches for mesh deformation: 
-	
-	Regenerate mesh each frame, or do displacement in vertex shader
-	Vertex shader approach would only require a single spline to define the whole thing.
-	Could also store mesh in compute buffer and use DrawProcedural
-	Using Burst for this test
 
-	Could also make it a softbody sim with constraints. Would fix uv-swimming.
-	
+	- Arrange mesh edges such that there is always a middle one that ends up right at the crease
+	(without this, with low tesselation, you see the crease jitter back and forth as edges slide in and out)
 
-	Need to calculate derivatives for normals
-	Need to move paper by control point (which itself is constrained)
-	Need to apply constant-area constraint and make middle control point solve that constraint
-	
-	When I have that, I send the mail.
-
-	So set it up that we move the paper edge, and it is constraint to a euclidean max distance from the start
-	of the fold. Then use a numerical algorithm to move the middle control point to satisfy length == 1
+	A few more approaches for mesh deformation to try: 
+	- Could also make it a softbody sim with constraints. Would fix uv-swimming.
+	- Compute shader
 
 	Reformulate without Euclidean distance metric.
+
+	Cubic spline
+	Momentum for control points. Now, given that we have a no-stretch constraint,
+	the paper should not have the degrees of freedom that allow the control points
+	to go places where scale goes non-unit. So any momentum we give it will need
+	to play out in the subset of unitary state space. It feels a little bit like
+	rotation. Momentum can rotate away.
  */
 
 public class BDCCurve : MonoBehaviour {
@@ -113,7 +109,7 @@ public class BDCCurve : MonoBehaviour {
 	}
 
 	private void Relax() {
-		// Todo: I want the partial derivatives of the following with respect to _po5s[1]
+		// Todo: I want the partial derivatives of the following with respect to _pos[1]
 		// But I can cheat for now
 
 		// First step: apply control point constraints
@@ -126,24 +122,33 @@ public class BDCCurve : MonoBehaviour {
 		}
 
 		// Step 2, relax the curvature control to be above ground, and keep paper area constant
+		// Todo: momentum
 
 		int iters = 0;
 		float deltaLength = 1f;
 		while (deltaLength > 0.001f && iters < 64) {
-            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], 64);
+			int refinementSteps = 4 + iters / 16;
+            float length = BDC3.LengthEuclidApprox(_curve[0], _curve[1], _curve[2], refinementSteps);
             float3 midPoint = (_curve[0] + _curve[2]) * 0.5f;
             float3 deltaFromMid = _curve[1] - midPoint;
             deltaLength = 4f - length;
             _curve[1] += deltaFromMid * deltaLength * Time.deltaTime * 20f;
-			_curve[1] += new float3(0f, -0.3f * Time.deltaTime, 0f); // a gravity term
+			_curve[1] += new float3(0f, -0.5f * Time.deltaTime, 0f); // a gravity term
 
 			_curve[1] = ClipHeight(_curve[1], 0f);
+            _curve[1] = StayLeftOf(_curve[1], _curve[2].x);
+
+			iters++;
 		}
 	}
 
 	private static float3 ClipHeight(float3 p, float min) {
 		return new float3(p.x, math.max(min, p.y), p.z);
 	}
+
+    private static float3 StayLeftOf(float3 p, float goal) {
+        return new float3(math.min(goal, p.x), p.y, p.z);
+    }
 
 	private void LateUpdate() {
         UpdateMesh();
@@ -184,6 +189,7 @@ public class BDCCurve : MonoBehaviour {
         Util.Copy(_trianglesMan, _triangles);
         Util.Copy(_uvsMan, _uvs);
 
+		// The below is now the biggest bottleneck, at 0.24ms per frame on my machine
         _mesh.vertices = _vertsMan;
         _mesh.normals = _normalsMan;
         _mesh.triangles = _trianglesMan;
@@ -203,18 +209,19 @@ public class BDCCurve : MonoBehaviour {
 
         public void Execute() {
             for (int i = 0; i < verts.Length; i++) {
-                var pos = Math.ToXZFloat(i, RES);
-				var posNorm = new float2(pos.x / (float)(RES-1), pos.z / (float)(RES-1));
+                var gridPos = Math.ToXZFloat(i, RES);
+				var gridPosUnit = gridPos / (float)(RES - 1);
 
-				var p = BDC3.Evaluate(curve[0], curve[1], curve[2], posNorm.x);
-				p.z = pos.z / (float)(RES - 1) * 4f;
+				var p = BDC3.Evaluate(curve[0], curve[1], curve[2], gridPosUnit.x);
+				p.z = gridPosUnit.z * 4f;
 
-				// Todo: this calculation can be cumulative along mesh, this is pretty wasteful
-				float uvx = BDC3.LengthEuclidApprox(distances, posNorm.x) / 4f;
-
-				normals[i] = BDC3.EvaluateNormalApprox(curve[0], curve[1], curve[2], posNorm.x);
+				normals[i] = BDC3.EvaluateNormalApprox(curve[0], curve[1], curve[2], gridPosUnit.x);
                 verts[i] = p;
-				uvs[i] = new float2(uvx, posNorm.y);
+
+                // Todo: this calculation can be cumulative along mesh, this is pretty wasteful
+                float uvx = BDC3.LengthEuclidApprox(distances, gridPosUnit.x) / distances[distances.Length-1];
+                uvs[i] = new float2(uvx, gridPosUnit.z);
+				
             }
 
 			int idx = 0;
@@ -271,15 +278,6 @@ public static class Util {
 		return new Vector3(p.x, p.y, 0f);
 	}
 
-    public static unsafe NativeArray<float3> GetNativeVertexArrays(Vector3[] vertexArray, NativeArray<float3> verts) {
-        fixed (void* vertexBufferPointer = vertexArray) {
-            UnsafeUtility.MemCpy(NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(verts),
-                vertexBufferPointer, vertexArray.Length * (long)UnsafeUtility.SizeOf<float3>());
-        }
-
-        return verts;
-    }
-
     public static unsafe void Copy(Vector3[] destination, NativeArray<float3> source) {
         fixed (void* vertexArrayPointer = destination) {
             UnsafeUtility.MemCpy(
@@ -307,38 +305,6 @@ public static class Util {
         }
     }
 
-}
-
-public static class BDC2 {
-	public static float Length(float2 v) {
-		return math.sqrt(v.x * v.x + v.y * v.y);
-	}
-
-	public static float2 Lerp(float2 a, float2 b, float t) {
-		return t * a + (1f - t) * b;
-	}
-	public static float2 EvaluateWithLerp(float2 a, float2 b, float2 c, float t) {
-		return Lerp(Lerp(a, b, t), Lerp(b, c, t), t);
-	}
-
-    public static float2 Evaluate(float2 a, float2 b, float2 c, float t) {
-        float2 u = 1f - t;
-		return u * u * a + 2f * t * u * b + t * t * c;
-    }
-
-	public static float LengthEuclidean(float2 a, float2 b, float2 c, int steps) {
-		float dist = 0;
-
-        float2 pPrev = BDC2.Evaluate(a, b, c, 0f);
-        for (int i = 1; i <= steps; i++) {
-            float t = i / (float)steps;
-            float2 p = BDC2.Evaluate(a, b, c, t);
-			dist += Length(p - pPrev);
-            pPrev = p;
-        }
-
-		return dist;
-	}
 }
 
 public static class BDC3 {
@@ -381,7 +347,7 @@ public static class BDC3 {
         return dist;
     }
 
-    public static float LengthEuclidApproxUnCached(float3 a, float3 b, float3 c, float t, int steps) {
+    public static float LengthEuclidApprox(float3 a, float3 b, float3 c, int steps, float t) {
         float dist = 0;
 
         float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
@@ -396,25 +362,58 @@ public static class BDC3 {
     }
 
     public static float LengthEuclidApprox(NativeArray<float> distances, float t) {
-        t = t * (distances.Length-1);
-		int ti = (int)t;
-		if (ti < 1) {
-			return 0f;
+        t = t * (float)(distances.Length-1);
+		int ti = (int)math.floor(t);
+		if (ti >= distances.Length-1) {
+			return distances[distances.Length-1];
 		}
-		return math.lerp(distances[ti-1], distances[ti], t - (float)ti);
+		return math.lerp(distances[ti], distances[ti+1], t - (float)ti);
     }
 
-	// Instead of storing at linear t spacing, why not store with non-linear t-spacing and lerp between them?
+	// Instead of storing at linear t spacing, why not store with non-linear t-spacing and lerp between them
 	public static void CacheDistances(float3 a, float3 b, float3 c, NativeArray<float> outDistances) {
         float dist = 0;
 		outDistances[0] = 0f;
-        float3 pPrev = BDC3.Evaluate(a, b, c, 0f);
+        float3 pPrev = BDC3.Evaluate(a, b, c, 0f); // Todo: this is just point a
 		for (int i = 1; i < outDistances.Length; i++) {
-            float t = (i / (float)outDistances.Length);
+            float t = i / (float)(outDistances.Length-1);
             float3 p = BDC3.Evaluate(a, b, c, t);
             dist += Length(p - pPrev);
 			outDistances[i] = dist;
             pPrev = p;
 		}
 	}
+}
+
+
+public static class BDC2 {
+    public static float Length(float2 v) {
+        return math.sqrt(v.x * v.x + v.y * v.y);
+    }
+
+    public static float2 Lerp(float2 a, float2 b, float t) {
+        return t * a + (1f - t) * b;
+    }
+    public static float2 EvaluateWithLerp(float2 a, float2 b, float2 c, float t) {
+        return Lerp(Lerp(a, b, t), Lerp(b, c, t), t);
+    }
+
+    public static float2 Evaluate(float2 a, float2 b, float2 c, float t) {
+        float2 u = 1f - t;
+        return u * u * a + 2f * t * u * b + t * t * c;
+    }
+
+    public static float LengthEuclidean(float2 a, float2 b, float2 c, int steps) {
+        float dist = 0;
+
+        float2 pPrev = BDC2.Evaluate(a, b, c, 0f);
+        for (int i = 1; i <= steps; i++) {
+            float t = i / (float)steps;
+            float2 p = BDC2.Evaluate(a, b, c, t);
+            dist += Length(p - pPrev);
+            pPrev = p;
+        }
+
+        return dist;
+    }
 }
