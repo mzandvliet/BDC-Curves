@@ -29,6 +29,7 @@ public class BDCCurve : MonoBehaviour {
 	[SerializeField] private Material _mat;
 
 	private NativeArray<float3> _curve;
+    private NativeArray<float3> _velocities;
 	private NativeArray<float> _distanceCache;
 	private Rng _rng;
 
@@ -55,6 +56,7 @@ public class BDCCurve : MonoBehaviour {
 
 	private void Awake () {
 		_curve = new NativeArray<float3>(4, Allocator.Persistent);
+        _velocities = new NativeArray<float3>(4, Allocator.Persistent);
         _distanceCache = new NativeArray<float>(32, Allocator.Persistent);
 
 		_curve[0] = new float3(-2f, 3f, 0f);
@@ -83,6 +85,7 @@ public class BDCCurve : MonoBehaviour {
 
 	private void OnDestroy() {
 		_curve.Dispose();
+        _velocities.Dispose();
 		_distanceCache.Dispose();
 
 		_verts.Dispose();
@@ -92,9 +95,9 @@ public class BDCCurve : MonoBehaviour {
 	}
 	
 	private void Update () {
-		// _curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 10f;
+		_curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 10f;
 
-		// Relax();
+		Relax();
 
 		BDC3Cube.CacheDistances(_curve, _distanceCache);
 
@@ -109,37 +112,76 @@ public class BDCCurve : MonoBehaviour {
 		JobHandle.ScheduleBatchedJobs();
 	}
 
-    // Todo: this needs to be rewritten with 2 control points in the middle for the cubic
 	private void Relax() {
-		// First step: apply control point constraints
+        // Todo: make the control points repel each other using the distance metric of integrated paper length
+        // I.e. proportional to the length of the formed curve. The paper distance, not the euclidean distance.
+        //
+        // Also: add a crease or curvature constraint?
 
-		_curve[0] = ClipHeight(_curve[0], 0.05f, 2f);
+        for (int k = 0; k < 8; k++) {
+            var forces = new NativeArray<float3>(_curve.Length, Allocator.Temp, NativeArrayOptions.ClearMemory);
+            for (int i = 0; i < _curve.Length - 1; i++) {
+                var delta = _curve[i + 1] - _curve[i];
+                float mag = math.length(delta);
+                mag = mag - 1.33f;
+                mag = (mag * mag) * math.sign(mag);
+                float3 force = math.normalize(delta) * mag;
 
-		var handleDelta = _curve[0] - _curve[2];
+                forces[i] += force * 0.01f;
+                forces[i + 1] -= force * 0.01f;
+            }
+
+            for (int i = 0; i < _curve.Length; i++) {
+                forces[i] += new float3(0, -0.001f, 0);
+            }
+
+            for (int i = 1; i < _curve.Length - 1; i++) {
+                _velocities[i] += forces[i];
+                _velocities[i] *= 0.99f;
+            }
+
+            for (int i = 0; i < _curve.Length; i++) {
+                _curve[i] += _velocities[i];
+            }
+
+            for (int i = 0; i < _curve.Length; i++) {
+                var p = _curve[i];
+                p.y = math.max(0f, p.y);
+                _curve[i] = p;
+                if (p.y < 0.001f && _velocities[i].y < 0f) {
+                    var v = _velocities[i];
+                    v.y = math.max(0f, _velocities[i].y);
+                    _velocities[i] = v;
+                }
+            }
+
+            forces.Dispose();
+        }
+        
+		var handleDelta = _curve[0] - _curve[3];
 		if (math.length(handleDelta) > 4f) {
-			_curve[0] = _curve[2] + math.normalize(handleDelta) * 4f;
+			_curve[0] = _curve[3] + math.normalize(handleDelta) * 4f;
 		}
 
-		// Step 2, relax the curvature control to be above ground, and keep paper area constant
 
-		int iters = 0;
-		float lengthError = 1f;
-		while (lengthError > 0.001f && iters < 64) {
-			int refinementSteps = 4 + iters / 16;
-            float length = BDC3Cube.LengthEuclidApprox(_curve, refinementSteps);
-			float3 midPoint = (_curve[2] + _curve[0]) * 0.5f;
-            float3 cord = math.normalize(_curve[2] - _curve[0]);
-			float3 perp = math.cross(cord, new float3(0f, 0f, 1f));
-            lengthError = length - 4f;
+		// int iters = 0;
+		// float lengthError = 1f;
+		// while (lengthError > 0.001f && iters < 64) {
+		// 	int refinementSteps = 4 + iters / 16;
+        //     float length = BDC3Cube.LengthEuclidApprox(_curve, refinementSteps);
+		// 	float3 midPoint = (_curve[2] + _curve[0]) * 0.5f;
+        //     float3 cord = math.normalize(_curve[2] - _curve[0]);
+		// 	float3 perp = math.cross(cord, new float3(0f, 0f, 1f));
+        //     lengthError = length - 4f;
 
-            _curve[1] += perp * (lengthError < 0f ? (lengthError * lengthError) * 1f : 0);
-            _curve[1] += math.normalize((_curve[1] - midPoint)) * -lengthError * 1f;
-			_curve[1] += new float3(0f, -0.02f * math.abs(lengthError), 0f); // a gravity term
+        //     _curve[1] += perp * (lengthError < 0f ? (lengthError * lengthError) * 1f : 0);
+        //     _curve[1] += math.normalize((_curve[1] - midPoint)) * -lengthError * 1f;
+		// 	_curve[1] += new float3(0f, -0.02f * math.abs(lengthError), 0f); // a gravity term
 
-			_curve[1] = ClipHeight(_curve[1], 0f, 4f);
+		// 	_curve[1] = ClipHeight(_curve[1], 0f, 4f);
 
-			iters++;
-		}
+		// 	iters++;
+		// }
 	}
 
 	private static float3 ClipHeight(float3 p, float min, float max) {
