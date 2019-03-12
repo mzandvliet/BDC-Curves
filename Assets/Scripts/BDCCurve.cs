@@ -5,6 +5,7 @@ using Unity.Collections;
 using Unity.Mathematics;
 using Rng = Unity.Mathematics.Random;
 using Unity.Collections.LowLevel.Unsafe;
+using System.Collections;
 
 /* Todo:
 
@@ -30,6 +31,7 @@ public class BDCCurve : MonoBehaviour {
 
 	private NativeArray<float3> _curve;
     private NativeArray<float3> _velocities;
+    private NativeArray<float3> _forces;
 	private NativeArray<float> _distanceCache;
 	private Rng _rng;
 
@@ -51,12 +53,15 @@ public class BDCCurve : MonoBehaviour {
     const int NUMVERTS = RES * RES;
 	const int NUMTRIS = (RES - 1) * (RES - 1) * 6;
 
+    const float DeltaTime = 0.016f;
+
 	JobHandle _handle;
 
 
 	private void Awake () {
 		_curve = new NativeArray<float3>(4, Allocator.Persistent);
         _velocities = new NativeArray<float3>(4, Allocator.Persistent);
+        _forces = new NativeArray<float3>(_curve.Length, Allocator.Persistent);
         _distanceCache = new NativeArray<float>(32, Allocator.Persistent);
 
 		_curve[0] = new float3(-2f, 3f, 0f);
@@ -83,85 +88,98 @@ public class BDCCurve : MonoBehaviour {
         _uvsMan = new Vector2[NUMVERTS];
     }
 
-	private void OnDestroy() {
-		_curve.Dispose();
+    private void OnDestroy() {
+        _curve.Dispose();
         _velocities.Dispose();
-		_distanceCache.Dispose();
+        _forces.Dispose();
+        _distanceCache.Dispose();
 
-		_verts.Dispose();
-		_normals.Dispose();
-		_triangles.Dispose();
-		_uvs.Dispose();
-	}
-	
-	private void Update () {
-		_curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 10f;
+        _verts.Dispose();
+        _normals.Dispose();
+        _triangles.Dispose();
+        _uvs.Dispose();
+    }
 
-		Relax();
+    private IEnumerator Start() {
+        while (true) {
+            _curve[0] += new float3(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"), 0f) * Time.deltaTime * 10f;
 
-		BDC3Cube.CacheDistances(_curve, _distanceCache);
+            Relax();
 
-        var j = new MakeMeshJob();
-        j.verts = _verts;
-        j.normals = _normals;
-        j.triangles = _triangles;
-        j.uvs = _uvs;
-        j.curve = _curve;
-		j.distances = _distanceCache;
-        _handle = j.Schedule();
-		JobHandle.ScheduleBatchedJobs();
-	}
+            BDC3Cube.CacheDistances(_curve, _distanceCache);
+
+            var j = new MakeMeshJob();
+            j.verts = _verts;
+            j.normals = _normals;
+            j.triangles = _triangles;
+            j.uvs = _uvs;
+            j.curve = _curve;
+            j.distances = _distanceCache;
+            _handle = j.Schedule();
+            JobHandle.ScheduleBatchedJobs();
+
+            yield return new WaitForSeconds(DeltaTime);
+        }
+    }
 
 	private void Relax() {
         // Todo: make the control points repel each other using the distance metric of integrated paper length
         // I.e. proportional to the length of the formed curve. The paper distance, not the euclidean distance.
         //
         // Also: add a crease or curvature constraint?
+        
 
-        for (int k = 0; k < 8; k++) {
-            var forces = new NativeArray<float3>(_curve.Length, Allocator.Temp, NativeArrayOptions.ClearMemory);
+        for (int k = 0; k < 4; k++) {
+            BDC3Cube.CacheDistances(_curve, _distanceCache);
+
+            for (int i = 0; i < _forces.Length; i++) {
+                _forces[i] = 0;
+            }
+
+            // Length-preserving push and pull between nodes
             for (int i = 0; i < _curve.Length - 1; i++) {
                 var delta = _curve[i + 1] - _curve[i];
-                float mag = math.length(delta);
+                float mag = BDC3Cube.LengthEuclidApprox(_distanceCache, (i+1) * 0.25f) - BDC3Cube.LengthEuclidApprox(_distanceCache, (i) * 0.25f);
                 mag = mag - 1.33f;
-                mag = (mag * mag) * math.sign(mag);
                 float3 force = math.normalize(delta) * mag;
 
-                forces[i] += force * 0.01f;
-                forces[i + 1] -= force * 0.01f;
+                _forces[i] += force;
+                _forces[i + 1] -= force;
             }
 
+            // Gravity
+            // for (int i = 0; i < _curve.Length; i++) {
+            //     _forces[i] += new float3(0, -0.0002f, 0);
+            // }
+
+            // Friction
+            for (int i = 1; i < _curve.Length; i++) {
+                _velocities[i] += _forces[i] * DeltaTime;
+                _velocities[i] *= 0.98f;
+            }
+
+            // Integration
             for (int i = 0; i < _curve.Length; i++) {
-                forces[i] += new float3(0, -0.001f, 0);
+                _curve[i] += _velocities[i] * DeltaTime;
             }
 
-            for (int i = 1; i < _curve.Length - 1; i++) {
-                _velocities[i] += forces[i];
-                _velocities[i] *= 0.99f;
-            }
-
-            for (int i = 0; i < _curve.Length; i++) {
-                _curve[i] += _velocities[i];
-            }
-
-            for (int i = 0; i < _curve.Length; i++) {
-                var p = _curve[i];
-                p.y = math.max(0f, p.y);
-                _curve[i] = p;
-                if (p.y < 0.001f && _velocities[i].y < 0f) {
-                    var v = _velocities[i];
-                    v.y = math.max(0f, _velocities[i].y);
-                    _velocities[i] = v;
-                }
-            }
-
-            forces.Dispose();
+            // Floor collision
+            // for (int i = 0; i < _curve.Length; i++) {
+            //     var p = _curve[i];
+            //     p.y = math.max(0f, p.y);
+            //     _curve[i] = p;
+            //     if (p.y < 0.001f && _velocities[i].y < 0f) {
+            //         var v = _velocities[i];
+            //         v.y = math.max(0f, _velocities[i].y);
+            //         _velocities[i] = v;
+            //     }
+            // }
         }
         
-		var handleDelta = _curve[0] - _curve[3];
-		if (math.length(handleDelta) > 4f) {
-			_curve[0] = _curve[3] + math.normalize(handleDelta) * 4f;
-		}
+		// var handleDelta = _curve[0] - _curve[3];
+		// if (math.length(handleDelta) > 4f) {
+		// 	_curve[0] = _curve[3] + math.normalize(handleDelta) * 4f;
+		// }
 
 
 		// int iters = 0;
@@ -204,6 +222,11 @@ public class BDCCurve : MonoBehaviour {
 		Gizmos.color = Color.blue;
         for (int i = 0; i < _curve.Length; i++) {
             Gizmos.DrawSphere(_curve[i], 0.05f);
+        }
+
+        Gizmos.color = Color.green;
+        for (int i = 0; i < _curve.Length; i++) {
+            Gizmos.DrawRay(_curve[i], _forces[i] * 100f);
         }
 
 		Gizmos.color = Color.white;
