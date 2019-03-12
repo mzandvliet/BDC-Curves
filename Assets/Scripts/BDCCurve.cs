@@ -24,6 +24,8 @@ using System.Collections;
 	to go places where scale goes non-unit. So any momentum we give it will need
 	to play out in the subset of unitary state space. It feels a little bit like
 	rotation. Momentum can rotate away.
+
+    Note that this current implentation uses cubics, but is pretty broken...
  */
 
 public class BDCCurve : MonoBehaviour {
@@ -125,37 +127,48 @@ public class BDCCurve : MonoBehaviour {
 	private void Relax() {
         // Todo: make the control points repel each other using the distance metric of integrated paper length
         // I.e. proportional to the length of the formed curve. The paper distance, not the euclidean distance.
+        // Coming up with smooth/stable/correct scheme is a fun challenge
         //
         // Also: add a crease or curvature constraint?
         
+        const float targetLength = 4f;
+        const float segmentTargetLength = targetLength / 3f;
 
         for (int k = 0; k < 4; k++) {
             BDC3Cube.CacheDistances(_curve, _distanceCache);
+            Debug.Log("Paper length: " + BDC3Cube.LengthEuclidApprox(_distanceCache, 1f));
 
             for (int i = 0; i < _forces.Length; i++) {
                 _forces[i] = 0;
             }
 
-            // Length-preserving push and pull between nodes
+            // Sort-of-length-preserving push and pull between nodes
+            // Todo: base on spline dist metric. Better handling of fixed constraints.
             for (int i = 0; i < _curve.Length - 1; i++) {
-                var delta = _curve[i + 1] - _curve[i];
-                float mag = BDC3Cube.LengthEuclidApprox(_distanceCache, (i+1) * 0.25f) - BDC3Cube.LengthEuclidApprox(_distanceCache, (i) * 0.25f);
-                mag = mag - 1.33f;
-                float3 force = math.normalize(delta) * mag;
+                var dir = _curve[i + 1] - _curve[i];
+                float segmentLength = 
+                    //BDC3Cube.LengthEuclidApprox(_distanceCache, (i+1) / (_curve.Length-1)) -
+                    //BDC3Cube.LengthEuclidApprox(_distanceCache, (i+0) / (_curve.Length-1));
+                    math.length(dir);
+                float3 force = math.normalize(dir) * PowMag((segmentLength - segmentTargetLength), 2f);
 
-                _forces[i] += force;
-                _forces[i + 1] -= force;
+                if (i > 0) {
+                    _forces[i] += force;
+                }
+                if (i < _curve.Length-2) {
+                    _forces[i + 1] -= force;
+                }
             }
 
             // Gravity
-            // for (int i = 0; i < _curve.Length; i++) {
-            //     _forces[i] += new float3(0, -0.0002f, 0);
-            // }
+            for (int i = 1; i < _curve.Length-1; i++) {
+                _forces[i] += new float3(0, -0.81f * DeltaTime, 0);
+            }
 
             // Friction
-            for (int i = 1; i < _curve.Length; i++) {
+            for (int i = 0; i < _curve.Length; i++) {
                 _velocities[i] += _forces[i] * DeltaTime;
-                _velocities[i] *= 0.98f;
+                _velocities[i] *= 0.995f;
             }
 
             // Integration
@@ -164,42 +177,23 @@ public class BDCCurve : MonoBehaviour {
             }
 
             // Floor collision
-            // for (int i = 0; i < _curve.Length; i++) {
-            //     var p = _curve[i];
-            //     p.y = math.max(0f, p.y);
-            //     _curve[i] = p;
-            //     if (p.y < 0.001f && _velocities[i].y < 0f) {
-            //         var v = _velocities[i];
-            //         v.y = math.max(0f, _velocities[i].y);
-            //         _velocities[i] = v;
-            //     }
-            // }
+            for (int i = 0; i < _curve.Length; i++) {
+                var p = _curve[i];
+                p.y = math.max(0f, p.y);
+                _curve[i] = p;
+                if (p.y < 0.001f && _velocities[i].y < 0f) {
+                    var v = _velocities[i];
+                    v.y = math.max(0f, _velocities[i].y);
+                    _velocities[i] = v;
+                }
+            }
         }
         
-		// var handleDelta = _curve[0] - _curve[3];
-		// if (math.length(handleDelta) > 4f) {
-		// 	_curve[0] = _curve[3] + math.normalize(handleDelta) * 4f;
-		// }
-
-
-		// int iters = 0;
-		// float lengthError = 1f;
-		// while (lengthError > 0.001f && iters < 64) {
-		// 	int refinementSteps = 4 + iters / 16;
-        //     float length = BDC3Cube.LengthEuclidApprox(_curve, refinementSteps);
-		// 	float3 midPoint = (_curve[2] + _curve[0]) * 0.5f;
-        //     float3 cord = math.normalize(_curve[2] - _curve[0]);
-		// 	float3 perp = math.cross(cord, new float3(0f, 0f, 1f));
-        //     lengthError = length - 4f;
-
-        //     _curve[1] += perp * (lengthError < 0f ? (lengthError * lengthError) * 1f : 0);
-        //     _curve[1] += math.normalize((_curve[1] - midPoint)) * -lengthError * 1f;
-		// 	_curve[1] += new float3(0f, -0.02f * math.abs(lengthError), 0f); // a gravity term
-
-		// 	_curve[1] = ClipHeight(_curve[1], 0f, 4f);
-
-		// 	iters++;
-		// }
+        // limit range of user's control point
+		var handleDelta = _curve[0] - _curve[3];
+		if (math.length(handleDelta) > targetLength) {
+			_curve[0] = _curve[3] + math.normalize(handleDelta) * targetLength;
+		}
 	}
 
 	private static float3 ClipHeight(float3 p, float min, float max) {
@@ -208,6 +202,11 @@ public class BDCCurve : MonoBehaviour {
 
     private static float3 StayLeftOf(float3 p, float goal) {
         return new float3(math.min(goal, p.x), p.y, p.z);
+    }
+
+    // Raise to power, preserve sign
+    private static float PowMag(float val, float pow) {
+        return math.sign(val) * math.pow(val, pow);
     }
 
 	private void LateUpdate() {
